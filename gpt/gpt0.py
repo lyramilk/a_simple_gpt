@@ -308,7 +308,7 @@ class Gpt(nn.Module):
     
 
     @torch.inference_mode()
-    def generate_word_stream(self, input: torch.Tensor, max_new_tokens: int = 1, top_k: int=None, top_p: float=None, temperature: float=None) -> Generator[int, None, None]:
+    def generate_word_stream(self, input: torch.Tensor, max_new_tokens: int = 1, top_k: Optional[int]=None, top_p: Optional[float]=None, temperature: Optional[float]=None) -> Generator[int, None, None]:
         """
         生成单词流
         Args:
@@ -446,30 +446,42 @@ class Gpt(nn.Module):
         return indices_to_remove
 
 
-    def logits_to_token(self, logits: torch.Tensor, top_k: int=None, top_p: float=None, temperature: float=None) -> torch.Tensor:
+    def logits_to_token(self, logits: torch.Tensor, top_k: Optional[int]=None, top_p: Optional[float]=None, temperature: Optional[float]=None) -> torch.Tensor:
         """
         根据top_k和top_p进行采样
         Args:
             logits: 输入张量 (batch_size, vocab_size)
             top_k: 如果>0，只保留概率最高的top_k个token
             top_p: 如果>0，只保留累积概率达到top_p的token
+            temperature: 温度参数，控制采样的随机性，温度越高，采样越随机
         Returns:
             torch.Tensor: 输出张量 (batch_size, vocab_size)
         """
+        
+        # 如果temperature有效，则对logits进行维度缩放
+        if temperature is not None:
+            if temperature <= 0.0:
+                return torch.argmax(logits, dim=-1)
+            # 温度越高，logits各元素越接近，概率越均匀。温度越低，logits各元素差异越大，概率越集中。
+            logits = logits / temperature
+        else:
+            if (top_k is None or top_k <= 0) and top_p is None:
+                return torch.argmax(logits, dim=-1)
+
+        # 如果top_k有效，则只保留概率最高的top_k个token
         if top_k is not None and top_k > 0:
             indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
             logits[indices_to_remove] = float('-inf')
 
-        if top_k is not None and top_p > 0.0:
-            for i in range(logits.size(0)):
-                indices_to_remove = self.top_p(logits[i], top_p)
-                logits[i, indices_to_remove] = float('-inf')
+        if top_p is not None:
+            if top_p > 0.0:
+                for i in range(logits.size(0)):
+                    indices_to_remove = self.top_p(logits[i], top_p)
+                    logits[i, indices_to_remove] = float('-inf')
+            else:
+                return torch.argmax(logits, dim=-1)
 
-        if temperature is not None and temperature > 0.0:   
-            probs = F.softmax(logits / temperature, dim=-1)
-        else:
-            probs = F.softmax(logits, dim=-1)
-
+        probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
         return next_token
 
@@ -575,7 +587,7 @@ class TextGpt:
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)  # 加载
         self.gpt = Gpt(self.tokenizer.vocab_size, d_model, num_attention_heads, num_layers, d_ff, context_len, end_token_id)
 
-    def generate(self, input: str, max_new_tokens: int = 1, top_k: int=None, top_p: float=None, temperature: float=None) -> Generator[str, None, None]:
+    def generate(self, input: str, max_new_tokens: int = 1, top_k: Optional[int]=None, top_p: Optional[float]=None, temperature: Optional[float]=None) -> Generator[str, None, None]:
         """
         生成文本
         Args:
