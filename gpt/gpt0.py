@@ -126,7 +126,7 @@ class MultiHeadAttention(nn.Module):
         """
         # 交换k的最后两个维度，以便进行矩阵乘法，否则形状不符合矩阵乘法要求。
         kt = input_k.transpose(2, 3) # (batch_size, num_attention_heads, head_dim, seq_len)
-        qk = torch.matmul(input_q, kt) # (batch_size, num_heads, seq_len, seq_len)
+        qk = torch.matmul(input_q, kt) # (batch_size, num_attention_heads, seq_len, seq_len)
         dk = input_k.size(-1) 
         
         # 缩放点积注意力
