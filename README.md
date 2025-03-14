@@ -30,5 +30,5 @@ pip install -r requirements.txt
 
 ```bash
 cd a_simple_gpt/gpt
-python gpt0.py
+python testgpt.py
 ```

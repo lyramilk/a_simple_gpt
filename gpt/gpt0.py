@@ -112,6 +112,7 @@ class MultiHeadAttention(nn.Module):
         self.wk = nn.Linear(d_model, d_model)
         self.wv = nn.Linear(d_model, d_model)
         self.wo = nn.Linear(d_model, d_model)
+        self.dk_sqrt = math.sqrt(self.head_dim)
     
     def scaled_dot_product_attention(self, input_q: torch.Tensor, input_k: torch.Tensor, input_v: torch.Tensor, mask: Optional[torch.Tensor]=None) -> torch.Tensor:
         """
@@ -120,17 +121,17 @@ class MultiHeadAttention(nn.Module):
             input_q: 查询张量 (batch_size, num_attention_heads, seq_len, head_dim)
             input_k: 键张量 (batch_size, num_attention_heads, seq_len, head_dim)
             input_v: 值张量 (batch_size, num_attention_heads, seq_len, head_dim)
-            mask: 掩码张量 (batch_size, seq_len, seq_len)
+            mask: 掩码张量 (batch_size, num_attention_heads, seq_len, seq_len)
         Returns:
             torch.Tensor: 注意力输出张量 (batch_size, num_attention_heads, seq_len, head_dim)
         """
         # 交换k的最后两个维度，以便进行矩阵乘法，否则形状不符合矩阵乘法要求。
-        kt = input_k.transpose(2, 3) # (batch_size, num_attention_heads, head_dim, seq_len)
-        qk = torch.matmul(input_q, kt) # (batch_size, num_attention_heads, seq_len, seq_len)
-        dk = input_k.size(-1) 
+        kt = input_k.transpose(2, 3) # kt (batch_size, num_attention_heads, head_dim, seq_len)
+        qk = torch.matmul(input_q, kt) # qk (batch_size, num_attention_heads, seq_len, seq_len)
+        # dk = input_k.size(-1)  dk和dk_sqrt由于在初始化的时候已经确定，所以不需要再计算
         
         # 缩放点积注意力
-        scaled_qk = qk / math.sqrt(dk)
+        scaled_qk = qk / self.dk_sqrt
         
         # 应用掩码
         if mask is not None:
@@ -148,7 +149,7 @@ class MultiHeadAttention(nn.Module):
         前向传播
         Args:
             input: 输入张量 (batch_size, seq_len, d_model)
-            mask: 掩码张量 (batch_size, seq_len, seq_len)
+            mask: 掩码张量 (batch_size, num_attention_heads, seq_len, seq_len)
         Returns:
             torch.Tensor: 注意力输出张量 (batch_size, seq_len, d_model)
         """
@@ -161,10 +162,6 @@ class MultiHeadAttention(nn.Module):
         input_q = input_q.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2) # (batch_size, num_attention_heads, seq_len, head_dim)
         input_k = input_k.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2) # (batch_size, num_attention_heads, seq_len, head_dim) 
         input_v = input_v.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2) # (batch_size, num_attention_heads, seq_len, head_dim)
-        
-        if mask is not None:
-            # 确保掩码的维度正确，扩展为(batch_size, 1, seq_len, seq_len)
-            mask = mask.unsqueeze(1)
             
         output = self.scaled_dot_product_attention(input_q, input_k, input_v, mask) # (batch_size, num_attention_heads, seq_len, head_dim)
 
@@ -222,7 +219,7 @@ class Block(nn.Module):
         前向传播
         Args:
             input: 输入张量 (batch_size, seq_len, d_model)
-            mask: 掩码张量 (batch_size, seq_len, seq_len)
+            mask: 掩码张量 (batch_size, num_attention_heads, seq_len, seq_len)
         Returns:
             torch.Tensor: 输出张量 (batch_size, seq_len, d_model)
         """
@@ -255,7 +252,7 @@ class OutputProbability(nn.Module):
         Returns:
             torch.Tensor: 输出张量 (batch_size, seq_len, vocab_size)
         """
-        x = input + self.norm(input) # (batch_size, seq_len, d_model)
+        x = self.norm(input) # (batch_size, seq_len, d_model)
         return self.lm_head(x) # (batch_size, seq_len, vocab_size)
 
 
@@ -278,6 +275,7 @@ class Gpt(nn.Module):
         self.context_len = context_len
         self.embedding = Embedding(vocab_size, d_model)
         self.positional_encoding = PositionalEncoding(d_model, context_len=context_len)
+        self.num_attention_heads = num_attention_heads
         self.blocks = nn.ModuleList([Block(d_model, num_attention_heads, d_ff) for _ in range(num_layers)])
         self.output_probability = OutputProbability(d_model, vocab_size)
         self.end_token_id = end_token_id
@@ -298,7 +296,7 @@ class Gpt(nn.Module):
         seq_len = input.size(1)
         # 创建下三角矩阵作为掩码
         mask = torch.tril(torch.ones((seq_len, seq_len), device=input.device))
-        mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
+        mask = mask.unsqueeze(0).expand(batch_size,self.num_attention_heads, -1, -1)
         
         for block in self.blocks:
             input = block(input, mask) # (batch_size, seq_len, d_model)
@@ -346,7 +344,7 @@ class Gpt(nn.Module):
             # 创建因果掩码
             seq_len = current_input.size(1)
             mask = torch.tril(torch.ones((seq_len, seq_len), device=current_input.device))
-            mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
+            mask = mask.unsqueeze(0).expand(batch_size,self.num_attention_heads, -1, -1)
             
             # 通过Transformer块
             for block in self.blocks:
@@ -365,7 +363,7 @@ class Gpt(nn.Module):
             if (next_token == self.end_token_id).all():
                 break
             
-            yield next_token[0]
+            yield next_token[0].item()
             # 将新token添加到序列中
             current_seq = torch.cat([current_seq, next_token], dim=1)
             
@@ -404,7 +402,7 @@ class Gpt(nn.Module):
             # 创建因果掩码
             seq_len = current_input.size(1)
             mask = torch.tril(torch.ones((seq_len, seq_len), device=current_input.device))
-            mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
+            mask = mask.unsqueeze(0).expand(batch_size,self.num_attention_heads, -1, -1)
             
             # 通过Transformer块
             for block in self.blocks:
@@ -432,10 +430,10 @@ class Gpt(nn.Module):
         """
         根据top_p进行采样
         Args:
-            logits_i: 输入张量 (batch_size, vocab_size)
+            logits_i: 输入张量 (vocab_size)
             top_p: 如果>0，只保留累积概率达到top_p的token
         Returns:
-            torch.Tensor: 输出张量 (batch_size, vocab_size)
+            torch.Tensor: 输出张量 (vocab_size)
         """
         sorted_logits, sorted_indices = torch.sort(logits_i, descending=True)
         probs = F.softmax(sorted_logits, dim=-1)
@@ -495,10 +493,10 @@ class Gpt(nn.Module):
             torch.Tensor: 损失值
         """
         logits = self.forward(input) # (batch_size, seq_len, vocab_size)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1),ignore_index=self.end_token_id)
         return loss
     
-    def learn(self, samples: list[torch.Tensor], epochs: int, stop_loss: float = 0.0, learning_rate: float = 1e-4, batch_size: int = 16):
+    def learn(self, samples: list[torch.Tensor], epochs: int, stop_loss: float = 0.0, learning_rate: float = 1e-4, batch_size: int = 16) -> float:
         """
         训练
         Args:
@@ -537,9 +535,10 @@ class Gpt(nn.Module):
 
         optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate)
         #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-        
+
+        avg_loss = 0;
         for epoch in range(epochs):
-            total_loss = 0
+            batch_total_loss = 0
             # 将训练数据分成批次
             i = 0
             while i < len(input_datas):
@@ -551,21 +550,16 @@ class Gpt(nn.Module):
                 loss.backward()
                 optimizer.step()
                 #scheduler.step()
-                total_loss += loss.item()
+                loss_item = loss.item()
+                batch_total_loss += loss_item
                 i += len(batch_target)
-
-                print(f"Epoch {epoch} batch {i} / {len(input_datas)} loss={loss.item() / len(batch_target)}")
-            
-            # 每个epoch结束后打印平均损失
-            avg_loss = total_loss / sample_count
-            #if epoch % 1 == 0:
-            print(f"Epoch {epoch} loss: {avg_loss}")
+            avg_loss = batch_total_loss / len(input_datas)
             if avg_loss < stop_loss:
                 print(f"训练结束，损失值为{avg_loss}，小于停止损失值{stop_loss}")
                 break;
         etime = time.time()
-        print(f"训练时间: {etime - stime}秒")
-
+        #print(f"训练时间: {etime - stime}秒")
+        return avg_loss
 
 
 class TextGpt:
@@ -583,7 +577,7 @@ class TextGpt:
             context_len: 上下文长度
             end_token_id: 结束token id
         """
-        tokenizer_path = snapshot_download("lyramilk/deepseek_v3_tokenizer")  # 下载分词器
+        tokenizer_path = snapshot_download("lyramilk/deepseek_v3_tokenizer",revision="v1.0.1")  # 下载分词器
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)  # 加载
         self.gpt = Gpt(self.tokenizer.vocab_size, d_model, num_attention_heads, num_layers, d_ff, context_len, end_token_id)
 
