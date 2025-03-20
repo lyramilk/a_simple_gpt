@@ -2,11 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Generator
+from typing import Optional, Generator, Iterable
 import time
 from torch.nn.utils.rnn import pad_sequence
 from modelscope import snapshot_download
 from transformers import AutoTokenizer
+import logging
+from multiprocessing import Pool,Queue
+import multiprocessing as mp
+
+
+
 
 class Embedding(nn.Module):
     """
@@ -32,7 +38,7 @@ class Embedding(nn.Module):
             torch.Tensor: 嵌入后的张量
         """
         return self.embedding(x) * math.sqrt(self.d_model)
-    
+
 class Normalization(nn.Module):
     """
     归一化层
@@ -74,7 +80,7 @@ class PositionalEncoding(nn.Module):
             context_len: 上下文长度
         """
         super().__init__()
-        self.positional_encoding = nn.Parameter(torch.zeros(context_len, d_model))
+        self.positional_encoding = nn.Parameter(torch.zeros(context_len, d_model)) # (context_len, d_model)
         self.positional_encoding.requires_grad = False
         
         position = torch.arange(0, context_len).unsqueeze(1)
@@ -113,7 +119,7 @@ class MultiHeadAttention(nn.Module):
         self.wv = nn.Linear(d_model, d_model)
         self.wo = nn.Linear(d_model, d_model)
         self.dk_sqrt = math.sqrt(self.head_dim)
-    
+
     def scaled_dot_product_attention(self, input_q: torch.Tensor, input_k: torch.Tensor, input_v: torch.Tensor, mask: Optional[torch.Tensor]=None) -> torch.Tensor:
         """
         缩放点积注意力
@@ -155,7 +161,7 @@ class MultiHeadAttention(nn.Module):
         """
         batch_size, seq_len, d_model = input.size()
         
-        input_q = self.wq(input)
+        input_q = self.wq(input) # 
         input_k = self.wk(input)
         input_v = self.wv(input)
 
@@ -193,9 +199,9 @@ class FeedForward(nn.Module):
         Returns:
             torch.Tensor: 前馈神经网络输出张量 (batch_size, seq_len, d_model)
         """
-
         return self.w2(F.silu(self.w1(input)))
-    
+
+
 class Block(nn.Module):
     """
     注意力和前馈神经网络合并成一个块一起翻倍
@@ -213,7 +219,7 @@ class Block(nn.Module):
         self.mha = MultiHeadAttention(d_model, num_attention_heads)
         self.norm2 = Normalization(d_model)
         self.ff = FeedForward(d_model, d_ff)
-        
+
     def forward(self, input: torch.Tensor, mask: Optional[torch.Tensor]=None) -> torch.Tensor:
         """
         前向传播
@@ -260,17 +266,17 @@ class Gpt(nn.Module):
     """
     生成式预训练语言模型
     """
-    def __init__(self, vocab_size: int, d_model: int = 128, num_attention_heads: int = 8, num_layers: int = 6, d_ff: int = 2048, context_len: int = 1024,end_token_id: int = 0):
+    def __init__(self, vocab_size: int, d_model: int = 768, num_attention_heads: int = 8, num_layers: int = 6, d_ff: int = 2048, context_len: int = 1024,end_token_id: int = 0):
         super().__init__()
         """
         初始化
         Args:
             vocab_size: 词汇表大小
             d_model: 模型维度
-            num_attention_heads: 注意力头数
-            num_layers: 层数
-            d_ff: 前馈网络维度
-            context_len: 上下文长度
+            num_attention_heads: 注意力头数，注意d_model要能被num_attention_heads整除
+            num_layers: 层数，通常设置为6~12
+            d_ff: 前馈网络维度，通常设置为d_model的2.5~8倍
+            context_len: 上下文长度，通常设置为1024~2048
         """
         self.context_len = context_len
         self.embedding = Embedding(vocab_size, d_model)
@@ -303,7 +309,6 @@ class Gpt(nn.Module):
         
         logits = self.output_probability(input) # (batch_size, seq_len, vocab_size)
         return logits
-    
 
     @torch.inference_mode()
     def generate_word_stream(self, input: torch.Tensor, max_new_tokens: int = 1, top_k: Optional[int]=None, top_p: Optional[float]=None, temperature: Optional[float]=None) -> Generator[int, None, None]:
@@ -496,11 +501,11 @@ class Gpt(nn.Module):
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1),ignore_index=self.end_token_id)
         return loss
     
-    def learn(self, samples: list[torch.Tensor], epochs: int, stop_loss: float = 0.0, learning_rate: float = 1e-4, batch_size: int = 16) -> float:
+    def learn(self, samples: Iterable[torch.Tensor], epochs: int, stop_loss: float = 0.0, learning_rate: float = 1e-4, batch_size: int = 16) -> float:
         """
         训练
         Args:
-            samples: 样本列表，每个样本是一个条训练数据，训练数据是一个(seq_len)的tensor
+            samples: 样本迭代器
             epochs: 训练轮数
             stop_loss: 停止训练的损失值
             learning_rate: 学习率
@@ -511,55 +516,113 @@ class Gpt(nn.Module):
         
         # 将训练数据转换为输入和目标
         stime = time.time()
-
-        sample_count = len(samples)
-
-        #batch_sample_len = min(max(len(seq) for seq in samples), self.context_len)
-        
-        input_datas = []
-        target_datas = []
-
-        
-        for sample in samples:
-            # 用end_token_id填充长度
-            #one_input = torch.cat([sample[:-1], torch.ones(batch_sample_len - len(sample) + 1, dtype=torch.long) * self.end_token_id])
-            #one_target = torch.cat([sample[1:], torch.ones(batch_sample_len - len(sample) + 1, dtype=torch.long) * self.end_token_id])
-            one_input = sample[:-1];
-            one_target = sample[1:];
-            input_datas.append(one_input)
-            target_datas.append(one_target)
-        
-        input_datas = pad_sequence(input_datas, batch_first=True, padding_value=self.end_token_id)
-        target_datas = pad_sequence(target_datas, batch_first=True, padding_value=self.end_token_id)
-
+        lasttime = time.time();
 
         optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate)
-        #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-
-        avg_loss = 0;
+        
+        step = 1
+        total_samples = 0
+        last_report_samples = 0
+        loss_item = 0.0
+        skipped_batches = 0  # 记录跳过的批次数量
+        
         for epoch in range(epochs):
-            batch_total_loss = 0
-            # 将训练数据分成批次
-            i = 0
-            while i < len(input_datas):
-                batch_input = input_datas[i:i+batch_size]
-                batch_target = target_datas[i:i+batch_size]
-                # 前向传播和反向传播
-                loss = self.back_propagate(batch_input, batch_target)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                #scheduler.step()
-                loss_item = loss.item()
-                batch_total_loss += loss_item
-                i += len(batch_target)
-            avg_loss = batch_total_loss / len(input_datas)
-            if avg_loss < stop_loss:
-                print(f"训练结束，损失值为{avg_loss}，小于停止损失值{stop_loss}")
-                break;
-        etime = time.time()
-        #print(f"训练时间: {etime - stime}秒")
-        return avg_loss
+            for batch in samples:
+                try:
+                    batch_input = [];
+                    batch_target = [];
+                    for sample in batch:
+                        one_input = sample[:-1]
+                        one_target = sample[1:]
+                        batch_input.append(one_input)
+                        batch_target.append(one_target)
+                        
+                    batch_input = pad_sequence(batch_input, batch_first=True, padding_value=self.end_token_id)
+                    batch_target = pad_sequence(batch_target, batch_first=True, padding_value=self.end_token_id)
+
+                    loss = self.back_propagate(batch_input, batch_target)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    loss_item = loss.item()
+                    total_samples += batch_input.size(0)
+                    if step % 100 == 0:
+                        tm = time.time();
+                        time_diff = tm - lasttime  # 上次汇报时间到现在经过的时间
+                        samples_diff = total_samples - last_report_samples  # 上次汇报时间到现在又处理了多少样本
+                        speed = samples_diff / time_diff
+                        logging.info(f"训练轮数: {epoch}, 步数: {step}, 损失值: {loss_item}, 已处理样本数: {total_samples}，处理速度{speed:.2f}，跳过批次数: {skipped_batches}")
+                        last_report_samples = total_samples;
+                        lasttime = tm;
+                    step += 1
+                    del batch_input
+                    del batch_target
+                
+                except torch.cuda.OutOfMemoryError:
+                    # 捕获CUDA内存不足错误
+                    skipped_batches += 1
+                    logging.warning(f"CUDA内存不足，跳过当前批次。已跳过批次数: {skipped_batches}")
+                    # 尝试清理内存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        if skipped_batches > 0:
+            logging.warning(f"训练完成，总共跳过了 {skipped_batches} 个批次")
+        
+        return loss_item
+
+
+_process_tokenizer = None
+
+class TextBatchTokenizer(Iterable[torch.Tensor]):
+    """
+    文本分词器
+    """
+    def __init__(self, samples: Iterable[str], batch_size: int, tokenizer_path: str):
+        self.samples = samples
+        self.batch_size = batch_size
+        self.tokenizer_path = tokenizer_path  # 分词器路径
+        # 使用类方法作为初始化函数
+        self.pool = Pool(10, initializer=self._initialize_worker, initargs=(self.tokenizer_path,))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.pool:
+            self.pool.close()
+            self.pool.join()
+
+    @classmethod
+    def _initialize_worker(cls,tokenizer_path):
+        """初始化工作进程，加载分词器到类变量中"""
+        global _process_tokenizer
+        _process_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        print(f"进程 {mp.current_process().name} 初始化完成，分词器已加载")
+
+    @classmethod
+    def _encode_text(cls,sample):
+        """使用类变量中的分词器进行编码"""
+        global _process_tokenizer
+        return _process_tokenizer.encode(sample, add_special_tokens=False)
+
+    def __iter__(self) -> Iterable[torch.Tensor]:
+        list_samples = []
+        for sample in self.samples:
+            list_samples.append(sample)
+            if len(list_samples) >= self.batch_size:
+                yield self.encode_batch(list_samples)
+                list_samples = []
+
+        if len(list_samples) > 0:
+            yield self.encode_batch(list_samples)
+            list_samples = []
+
+    def encode_batch(self, list_samples: list[str]) -> list[torch.Tensor]:
+        # 使用类方法进行编码
+        results = self.pool.map(self._encode_text, list_samples)
+        return [torch.tensor(result) for result in results]
+
 
 
 class TextGpt:
@@ -577,7 +640,8 @@ class TextGpt:
             context_len: 上下文长度
             end_token_id: 结束token id
         """
-        tokenizer_path = snapshot_download("lyramilk/deepseek_v3_tokenizer",revision="v1.0.1")  # 下载分词器
+        #tokenizer_path = snapshot_download("lyramilk/deepseek_v3_tokenizer",revision="v1.0.1")  # 下载分词器
+        tokenizer_path = "/data/coding/minimind_tokenizer"
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)  # 加载
         self.gpt = Gpt(self.tokenizer.vocab_size, d_model, num_attention_heads, num_layers, d_ff, context_len, end_token_id)
 
@@ -602,11 +666,11 @@ class TextGpt:
             yield self.tokenizer.decode(output_token)
 
 
-    def learn(self, samples: list[str], epochs: int, stop_loss: float = 0.0, learning_rate: float = 1e-4, batch_size: int = 16) -> float:
+    def learn(self, samples: Iterable[str], epochs: int, stop_loss: float = 0.0, learning_rate: float = 1e-4, batch_size: int = 16) -> float:
         """
         训练
         Args:
-            samples: 样本列表，每个样本是一个字符串
+            samples: 样本迭代器，每个样本是一个字符串
             epochs: 训练轮数
             stop_loss: 停止训练的损失值
             learning_rate: 学习率
@@ -614,9 +678,21 @@ class TextGpt:
         Returns:
             float: 平均损失值
         """
-        train_data = [self.tokenizer.encode(txt, add_special_tokens=False) for txt in samples]
-        train_data = [torch.tensor(tokens) for tokens in train_data]
-        return self.gpt.learn(train_data, epochs, stop_loss, learning_rate, batch_size)
+        
+        tokenizer = TextTokenizer(samples, batch_size, self.tokenizer.name_or_path)
+
+        
+        #train_data = [tokenize(txt) for txt in samples]
+        
+        #train_data = [self.tokenizer.encode(txt, add_special_tokens=False) for txt in samples]
+        #train_data = [torch.tensor(tokens) for tokens in train_data]
+        return self.gpt.learn(tokenizer, epochs, stop_loss, learning_rate, batch_size)
+
+    def parameter_count(self) -> int:
+        """
+        参数数量
+        """
+        return sum(p.numel() for p in self.gpt.parameters() if p.requires_grad)
 
     def save_model(self, path: str):
         """
@@ -639,8 +715,8 @@ if __name__ == "__main__":
         torch.set_default_device("cuda")
     
     train_text = """
-糖是面包的成分<｜end▁of▁sentence｜>
-蛋白质是面包的成分<｜end▁of▁sentence｜>
+糖是面包的成分
+蛋白质是面包的成分
 """
 
     train_data = [txt for txt in train_text.split("\n") if txt.strip()];
@@ -649,22 +725,49 @@ if __name__ == "__main__":
     for t in ("香蕉","橘子","苹果","梨","葡萄","西瓜","草莓","芒果"):
         y = ["糖","蛋白质"]
         
-        train_data.append(f"{t}{y[0]}是{t}的成分<｜end▁of▁sentence｜>") 
-        train_data.append(f"{t}{y[1]}是{t}的成分<｜end▁of▁sentence｜>")
-        train_data.append(f"{t}的成分包含{t}{y[0]}和{t}{y[1]}<｜end▁of▁sentence｜>")
+        train_data.append(f"{t}{y[0]}是{t}的成分") 
+        train_data.append(f"{t}{y[1]}是{t}的成分")
+        train_data.append(f"{t}的成分包含{t}{y[0]}和{t}{y[1]}")
 
     tinylm = TextGpt()
 
     print("训练样本")
     for txt in train_data:
         print(txt)
-    tinylm.learn(train_data, epochs=20,stop_loss=0.01, learning_rate=0.001, batch_size=10)
+    tinylm.learn(train_data, epochs=10,stop_loss=0.01, learning_rate=0.001, batch_size=10)
+    tinylm.save_model(r"e:\gpt.pth")
+    #tinylm.load_model(r"e:\gpt.pth")
 
     test_text = "面包的成分包含";
 
     print("生成结果")
-    for w in tinylm.generate(test_text, max_new_tokens=200, top_p=0.9, temperature=0.7):
-        if w == "<｜end▁of▁sentence｜>":
+    for w in tinylm.generate(test_text, max_new_tokens=200, top_p=0.4, temperature=0.7):
+        if w == "":
+            print();
+            break;
+        print(w, end="", flush=True)
+    for w in tinylm.generate(test_text, max_new_tokens=200, top_p=0.9, temperature=0.5):
+        if w == "":
+            print();
+            break;
+        print(w, end="", flush=True)
+    for w in tinylm.generate(test_text, max_new_tokens=200, top_p=0.4, temperature=0.7):
+        if w == "":
+            print();
+            break;
+        print(w, end="", flush=True)
+    for w in tinylm.generate(test_text, max_new_tokens=200, top_p=0.4, temperature=0.7):
+        if w == "":
+            print();
+            break;
+        print(w, end="", flush=True)
+    for w in tinylm.generate(test_text, max_new_tokens=200, top_p=0.4, temperature=0.7):
+        if w == "":
+            print();
+            break;
+        print(w, end="", flush=True)
+    for w in tinylm.generate(test_text, max_new_tokens=200, top_p=0.4, temperature=0.7):
+        if w == "":
             print();
             break;
         print(w, end="", flush=True)
